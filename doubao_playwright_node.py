@@ -162,19 +162,16 @@ def _log(message: str) -> None:
     print(f"[Doubao AI Playwright] {message}", flush=True)
 
 
-def _looks_like_image_generation_request(prompt_text: str) -> bool:
-    text = _clean_text(prompt_text).lower()
-    if not text:
-        return False
-    patterns = [
-        r"生成.{0,12}(图|图片|照片|海报|插画|壁纸|头像)",
-        r"(出图|生图|作图|绘图|画图)",
-        r"(画一张|画一个|画出|绘制|做一张|做一个).{0,20}(图|图片|照片|海报|插画|壁纸|头像)?",
-        r"(重绘|改成|变成|换成|添加|去除|替换|风格化|修图|扩图|高清化)",
-        r"(generate|create|make|draw|render).{0,30}(image|picture|photo|poster|illustration|wallpaper)",
-        r"(image generation|generate an image|create an image)",
-    ]
-    return any(re.search(pattern, text, re.I) for pattern in patterns)
+def _find_browser_extension_dir() -> Path | None:
+    extension_root = Path(__file__).resolve().parent / "browser_extension"
+    preferred = extension_root / "doubao-watermark--完整版"
+    if (preferred / "manifest.json").is_file():
+        return preferred
+    if extension_root.is_dir():
+        for path in extension_root.iterdir():
+            if path.is_dir() and (path / "manifest.json").is_file():
+                return path
+    return None
 
 
 class DoubaoPlaywrightSession:
@@ -183,7 +180,7 @@ class DoubaoPlaywrightSession:
         self._playwright: Any | None = None
         self._context: Any | None = None
         self._page: Any | None = None
-        self._settings_key: tuple[str, str, bool] | None = None
+        self._settings_key: tuple[str, str, bool, str] | None = None
         self._brought_to_front_for_context = False
 
     def send_and_collect(
@@ -206,15 +203,12 @@ class DoubaoPlaywrightSession:
         stable_seconds: int,
         min_output_images: int,
         try_hd_download: bool,
+        collect_images: bool,
     ) -> tuple[list[Path], str]:
         with self._lock:
-            requested_min_output_images = int(min_output_images)
-            if requested_min_output_images <= 0 and _looks_like_image_generation_request(prompt_text):
-                min_output_images = 1
-                _log("检测到提示词像生图任务，min_output_images 从 0 自动修正为 1")
-            else:
-                min_output_images = max(0, min(4, requested_min_output_images))
-            _log(f"节点实际等待图片数：{min_output_images}（传入值：{requested_min_output_images}）")
+            min_output_images = max(0, min(4, int(min_output_images))) if collect_images else 0
+            mode_label = "图像输出" if collect_images else "纯文本输出"
+            _log(f"运行模式：{mode_label}，等待图片数：{min_output_images}")
 
             _log("准备打开或复用浏览器页面")
             page = self._ensure_page(
@@ -238,6 +232,11 @@ class DoubaoPlaywrightSession:
                 _log("尝试开启新对话")
                 self._open_new_chat(page, website_url, new_chat_selector, wait_timeout)
 
+            before_extension_image_keys: set[str] = set()
+            if collect_images:
+                self._install_extension_image_capture(page)
+                before_extension_image_keys = self._collect_extension_image_keys(page)
+
             if image_paths or prompt_text.strip():
                 if image_paths:
                     _log(f"准备上传/粘贴 {len(image_paths)} 张图片")
@@ -249,26 +248,43 @@ class DoubaoPlaywrightSession:
 
                 before_texts = self._collect_text_candidates(page, assistant_message_selector)
                 before_body = self._body_text(page)
-                before_images = self._collect_image_items(page)
-                before_image_keys = {item["key"] for item in before_images}
-
-                before_signature = self._signature(page)
+                before_image_keys: set[str] = set()
+                if collect_images:
+                    before_images = self._collect_image_items(page)
+                    before_image_keys = {item["key"] for item in before_images}
+                    before_signature = self._signature(page)
+                else:
+                    before_signature = self._text_signature(page)
                 _log("准备发送消息")
                 self._send_message(page, send_button_selector, wait_timeout)
 
-                _log(f"等待豆包回复稳定，至少等待 {min_output_images} 张新图片")
-                wait_result = self._wait_until_response_stable(
-                    page,
-                    before_signature=before_signature,
-                    before_image_keys=before_image_keys,
-                    timeout_seconds=wait_timeout,
-                    stable_seconds=stable_seconds,
-                    min_output_images=min_output_images,
-                )
+                if collect_images:
+                    _log(f"等待豆包回复稳定，至少等待 {min_output_images} 张新图片")
+                    wait_result = self._wait_until_response_stable(
+                        page,
+                        before_signature=before_signature,
+                        before_image_keys=before_image_keys,
+                        before_extension_image_keys=before_extension_image_keys,
+                        timeout_seconds=wait_timeout,
+                        stable_seconds=stable_seconds,
+                        min_output_images=min_output_images,
+                    )
+                else:
+                    _log("等待豆包文字回复稳定")
+                    wait_result = self._wait_until_text_response_stable(
+                        page,
+                        before_signature=before_signature,
+                        assistant_message_selector=assistant_message_selector,
+                        before_texts=before_texts,
+                        before_body=before_body,
+                        prompt_text=prompt_text,
+                        timeout_seconds=wait_timeout,
+                        stable_seconds=stable_seconds,
+                    )
             else:
                 before_texts = self._collect_text_candidates(page, assistant_message_selector)
                 before_body = self._body_text(page)
-                before_image_keys = {item["key"] for item in self._collect_image_items(page)}
+                before_image_keys = set()
                 wait_result = "no_input"
 
             generated_text = self._extract_generated_text(
@@ -280,9 +296,29 @@ class DoubaoPlaywrightSession:
             )
             _log(f"提取到文本长度 {len(generated_text)}")
 
-            if wait_result == "text_only":
-                _log("本轮判断为纯文字回复，跳过图片检测和下载")
+            if not collect_images or wait_result == "text_only":
+                _log("本轮无需输出图片，跳过图片检测和下载")
                 return [], generated_text
+
+            downloaded: list[Path] = []
+            run_id = time.strftime("%Y%m%d_%H%M%S")
+            extension_items = [
+                item for item in self._collect_extension_image_items(page)
+                if item["key"] not in before_extension_image_keys
+            ]
+            if extension_items:
+                _log(f"插件捕获到本轮无水印图片链接 {len(extension_items)} 条，优先下载")
+                downloaded.extend(
+                    self._download_extension_images(
+                        page,
+                        extension_items[:4],
+                        save_dir,
+                        run_id,
+                        wait_timeout,
+                    )
+                )
+            if downloaded:
+                return downloaded[:4], generated_text
 
             image_items = [
                 item for item in self._collect_image_items(page)
@@ -300,8 +336,6 @@ class DoubaoPlaywrightSession:
                     )
                 )
 
-            downloaded: list[Path] = []
-            run_id = time.strftime("%Y%m%d_%H%M%S")
             conversation_url = page.url
             for index, item in enumerate(image_items, start=1):
                 stem = f"doubao_{run_id}_{index:02d}"
@@ -352,7 +386,9 @@ class DoubaoPlaywrightSession:
         profile_dir.mkdir(parents=True, exist_ok=True)
         channel = (browser_channel or "").strip()
         executable = (browser_executable_path or "").strip()
-        settings_key = (str(profile_dir), executable or channel, headless)
+        extension_dir = _find_browser_extension_dir()
+        extension_key = str(extension_dir) if extension_dir is not None else ""
+        settings_key = (str(profile_dir), executable or channel, headless, extension_key)
 
         if self._page_is_alive() and self._settings_key == settings_key:
             return self._page
@@ -369,6 +405,16 @@ class DoubaoPlaywrightSession:
             "no_viewport": True,
             "args": ["--start-maximized"],
         }
+        if extension_dir is not None and not headless:
+            extension_path = str(extension_dir)
+            kwargs["args"].extend([
+                f"--disable-extensions-except={extension_path}",
+                f"--load-extension={extension_path}",
+            ])
+            _log(f"已配置加载浏览器扩展：{extension_path}")
+        elif extension_dir is None:
+            _log("未找到 browser_extension 下的插件目录，本次浏览器不会加载无水印扩展")
+
         if executable:
             kwargs["executable_path"] = executable
         elif channel and channel.lower() not in {"chromium", "bundled", "default"}:
@@ -639,6 +685,7 @@ class DoubaoPlaywrightSession:
         *,
         before_signature: str,
         before_image_keys: set[str],
+        before_extension_image_keys: set[str] | None = None,
         timeout_seconds: int,
         stable_seconds: int,
         min_output_images: int,
@@ -649,21 +696,37 @@ class DoubaoPlaywrightSession:
         stable_since = time.monotonic()
         saw_change = False
         saw_generation_hint = False
-        min_wait = max(8, stable_seconds)
+        min_wait = max(2.0, min(float(stable_seconds), 4.0))
         target_images = max(0, min(4, int(min_output_images)))
         last_reported_image_count = -1
+        last_reported_extension_count = -1
+        before_extension_image_keys = before_extension_image_keys or set()
 
         while time.monotonic() < deadline:
             signature = self._signature(page)
             generating = self._looks_generating(page)
+            waited = time.monotonic() - started
             new_image_count = len([
                 item for item in self._collect_image_items(page)
                 if item["key"] not in before_image_keys
+            ])
+            extension_image_count = len([
+                item for item in self._collect_extension_image_items(page)
+                if item["key"] not in before_extension_image_keys
             ])
             has_required_images = new_image_count >= target_images
             saw_generation_hint = saw_generation_hint or generating
             if signature != before_signature:
                 saw_change = True
+
+            if extension_image_count != last_reported_extension_count:
+                last_reported_extension_count = extension_image_count
+                if target_images:
+                    _log(f"插件当前捕获到无水印图片 {extension_image_count}/{target_images} 张")
+
+            if target_images and extension_image_count >= target_images and waited >= 1.0:
+                if not generating or waited >= 3.0:
+                    return "extension_images_ready"
 
             if new_image_count != last_reported_image_count:
                 last_reported_image_count = new_image_count
@@ -672,7 +735,6 @@ class DoubaoPlaywrightSession:
 
             if signature == last_signature and not generating:
                 stable_for = time.monotonic() - stable_since
-                waited = time.monotonic() - started
                 if has_required_images and saw_change and waited >= min_wait and stable_for >= stable_seconds:
                     return "images_ready" if target_images else "text_ready"
                 if target_images == 0 and not saw_generation_hint and waited >= 15 and stable_for >= stable_seconds:
@@ -693,7 +755,7 @@ class DoubaoPlaywrightSession:
                 stable_since = time.monotonic()
                 last_signature = signature
 
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(500)
 
         raise TimeoutError(
             f"等待豆包回复或图片生成超时（{timeout_seconds} 秒）。"
@@ -704,10 +766,121 @@ class DoubaoPlaywrightSession:
 
     def _looks_generating(self, page: Any) -> bool:
         try:
-            pattern = re.compile(r"停止生成|停止回答|正在生成|生成中|思考中|Stop generating|Generating", re.I)
-            return page.get_by_text(pattern).count() > 0
+            return bool(page.evaluate(
+                """
+                () => {
+                    const visible = (element) => {
+                        const rect = element.getBoundingClientRect();
+                        const style = window.getComputedStyle(element);
+                        return rect.width > 1 &&
+                            rect.height > 1 &&
+                            style.display !== "none" &&
+                            style.visibility !== "hidden";
+                    };
+                    const stopPattern = /停止生成|停止回答|Stop generating|Stop responding/i;
+                    const statusPattern = /正在生成|生成中|思考中|Thinking|Generating/i;
+
+                    for (const element of document.querySelectorAll("button, [role='button'], [aria-label], [title]")) {
+                        if (!visible(element)) continue;
+                        const label = [
+                            element.innerText || "",
+                            element.getAttribute("aria-label") || "",
+                            element.getAttribute("title") || ""
+                        ].join(" ");
+                        if (stopPattern.test(label)) return true;
+                    }
+
+                    for (const element of document.querySelectorAll("[aria-live], [class*='loading'], [class*='generat'], [class*='thinking']")) {
+                        if (!visible(element)) continue;
+                        const text = (element.innerText || element.textContent || "").trim();
+                        if (text.length <= 80 && statusPattern.test(text)) return true;
+                    }
+                    return false;
+                }
+                """
+            ))
         except Exception:
             return False
+
+    def _wait_until_text_response_stable(
+        self,
+        page: Any,
+        *,
+        before_signature: str,
+        assistant_message_selector: str,
+        before_texts: list[str],
+        before_body: str,
+        prompt_text: str,
+        timeout_seconds: int,
+        stable_seconds: int,
+    ) -> str:
+        del before_signature
+        deadline = time.monotonic() + timeout_seconds
+        started = time.monotonic()
+        last_text = ""
+        text_stable_since = time.monotonic()
+        saw_change = False
+        min_wait = 1.5
+
+        while time.monotonic() < deadline:
+            generating = self._looks_generating(page)
+            current_text = self._extract_generated_text(
+                page,
+                assistant_message_selector=assistant_message_selector,
+                before_texts=before_texts,
+                before_body=before_body,
+                prompt_text=prompt_text,
+            )
+            if current_text:
+                saw_change = True
+
+            if current_text != last_text:
+                last_text = current_text
+                text_stable_since = time.monotonic()
+
+            if current_text and not generating:
+                stable_for = time.monotonic() - text_stable_since
+                waited = time.monotonic() - started
+                required_stable_seconds = self._required_text_stable_seconds(
+                    current_text,
+                    stable_seconds,
+                    prompt_text,
+                )
+                if saw_change and waited >= min_wait and stable_for >= required_stable_seconds:
+                    return "text_ready"
+
+            page.wait_for_timeout(300)
+
+        raise TimeoutError(
+            f"等待豆包文字回复超时（{timeout_seconds} 秒）。"
+            "可以增大 wait_timeout，或手动检查浏览器里是否需要登录、验证或确认权限。"
+        )
+
+    @staticmethod
+    def _required_text_stable_seconds(text: str, stable_seconds: int, prompt_text: str) -> float:
+        text_length = len(_clean_text(text))
+        configured = float(stable_seconds)
+        prompt_clean = _clean_text(prompt_text)
+        expects_long_answer = bool(re.search(r"详细|描述|分析|说明|describe|detail|analyze", prompt_clean, re.I))
+        if expects_long_answer and text_length < 60:
+            return max(5.0, min(configured, 8.0))
+        if expects_long_answer and text_length < 120:
+            return max(2.5, min(configured, 5.0))
+        if text_length < 12:
+            return max(4.0, min(configured, 6.0))
+        if text_length < 50:
+            return max(2.5, min(configured, 4.0))
+        return max(1.2, min(configured, 1.8))
+
+    def _text_signature(self, page: Any) -> str:
+        try:
+            return page.evaluate(
+                """
+                () => (document.body?.innerText || "").slice(-10000)
+                """
+            )
+        except Exception:
+            return str(time.time())
 
     def _signature(self, page: Any) -> str:
         try:
@@ -735,6 +908,92 @@ class DoubaoPlaywrightSession:
         except Exception:
             return ""
 
+    def _install_extension_image_capture(self, page: Any) -> None:
+        try:
+            page.evaluate(
+                """
+                () => {
+                    if (window.__doubaoNodeImageCaptureInstalled) return;
+                    window.__doubaoNodeImageCaptureInstalled = true;
+                    window.__doubaoNodeImageData = window.__doubaoNodeImageData || [];
+                    window.addEventListener("message", (event) => {
+                        const payload = event?.data || {};
+                        if (
+                            payload.type !== "imageDataExtracted" &&
+                            payload.type !== "aptpreset_doubao_image_data"
+                        ) {
+                            return;
+                        }
+                        const items = Array.isArray(payload.data) ? payload.data : [];
+                        for (const item of items) {
+                            const url = item?.no_watermark_url || item?.watermark_url;
+                            if (!url) continue;
+                            window.__doubaoNodeImageData.push({
+                                no_watermark_url: item.no_watermark_url || "",
+                                watermark_url: item.watermark_url || "",
+                                width: item.width || 0,
+                                height: item.height || 0,
+                                captured_at: Date.now()
+                            });
+                        }
+                    }, true);
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    def _collect_extension_image_items(self, page: Any) -> list[dict[str, Any]]:
+        try:
+            items = page.evaluate(
+                """
+                () => {
+                    const seen = new Set();
+                    const output = [];
+                    for (const item of window.__doubaoNodeImageData || []) {
+                        const url = item.no_watermark_url || item.watermark_url || "";
+                        if (!url || seen.has(url)) continue;
+                        seen.add(url);
+                        output.push({
+                            key: url,
+                            noWatermarkUrl: item.no_watermark_url || "",
+                            watermarkUrl: item.watermark_url || "",
+                            width: item.width || 0,
+                            height: item.height || 0,
+                            capturedAt: item.captured_at || 0
+                        });
+                    }
+                    return output;
+                }
+                """
+            )
+            return list(items)
+        except Exception:
+            return []
+
+    def _collect_extension_image_keys(self, page: Any) -> set[str]:
+        return {item["key"] for item in self._collect_extension_image_items(page)}
+
+    def _download_extension_images(
+        self,
+        page: Any,
+        items: list[dict[str, Any]],
+        save_dir: Path,
+        run_id: str,
+        timeout: int,
+    ) -> list[Path]:
+        downloaded: list[Path] = []
+        for index, item in enumerate(items, start=1):
+            url = item.get("noWatermarkUrl") or item.get("watermarkUrl") or ""
+            if not url:
+                continue
+            stem = f"doubao_{run_id}_{index:02d}_no_watermark"
+            path = self._download_image_src(page, url, save_dir, stem, timeout)
+            if path is not None:
+                _log(f"已通过插件无水印链接保存图片：{path}")
+                downloaded.append(path)
+        return downloaded
+
     def _collect_text_candidates(self, page: Any, selector: str) -> list[str]:
         selectors = [selector.strip()] if selector.strip() else TEXT_CANDIDATE_SELECTORS
         texts: list[str] = []
@@ -748,7 +1007,73 @@ class DoubaoPlaywrightSession:
                     break
             except Exception:
                 continue
+        for text in self._collect_parent_text_candidates(page, selector):
+            if text and text not in texts:
+                texts.append(text)
         return texts
+
+    def _collect_parent_text_candidates(self, page: Any, selector: str) -> list[str]:
+        selectors = [selector.strip()] if selector.strip() else TEXT_CANDIDATE_SELECTORS
+        try:
+            texts = page.evaluate(
+                """
+                (selectors) => {
+                    const blockedTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "SVG", "BUTTON", "INPUT", "TEXTAREA"]);
+                    const clean = (text) => (text || "").replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n").replace(/[ \\t]+\\n/g, "\\n").replace(/\\n{3,}/g, "\\n\\n").trim();
+                    const visible = (element) => {
+                        const rect = element.getBoundingClientRect();
+                        const style = window.getComputedStyle(element);
+                        return rect.width > 1 &&
+                            rect.height > 1 &&
+                            style.display !== "none" &&
+                            style.visibility !== "hidden";
+                    };
+                    const looksLikeMessage = (element) => {
+                        const attrs = [
+                            element.getAttribute("class") || "",
+                            element.getAttribute("role") || "",
+                            element.getAttribute("data-testid") || "",
+                            element.getAttribute("data-message-author-role") || ""
+                        ].join(" ");
+                        return /assistant|bot|markdown|message|chat|answer|article|content|bubble|item/i.test(attrs);
+                    };
+                    const output = [];
+                    const seen = new Set();
+                    const push = (element) => {
+                        if (!element || blockedTags.has(element.tagName) || !visible(element)) return;
+                        const text = clean(element.innerText || element.textContent || "");
+                        if (text.length < 2 || seen.has(text)) return;
+                        seen.add(text);
+                        output.push(text);
+                    };
+
+                    for (const selector of selectors) {
+                        for (const element of document.querySelectorAll(selector)) {
+                            const baseText = clean(element.innerText || element.textContent || "");
+                            if (!baseText) continue;
+                            push(element);
+                            let current = element.parentElement;
+                            for (let depth = 0; depth < 6 && current && current !== document.body; depth += 1) {
+                                const currentText = clean(current.innerText || current.textContent || "");
+                                if (
+                                    currentText.includes(baseText) &&
+                                    currentText.length <= Math.max(baseText.length + 6000, baseText.length * 8) &&
+                                    (depth <= 2 || looksLikeMessage(current))
+                                ) {
+                                    push(current);
+                                }
+                                current = current.parentElement;
+                            }
+                        }
+                    }
+                    return output;
+                }
+                """,
+                selectors,
+            )
+            return [_clean_text(str(text)) for text in texts if _clean_text(str(text))]
+        except Exception:
+            return []
 
     def _extract_generated_text(
         self,
@@ -761,22 +1086,24 @@ class DoubaoPlaywrightSession:
     ) -> str:
         after_texts = self._collect_text_candidates(page, assistant_message_selector)
         before_set = set(before_texts)
+        before_blocks = set(self._split_text_blocks("\n".join(before_texts) + "\n" + before_body))
         prompt_clean = _clean_text(prompt_text)
         new_texts = [
-            text for text in after_texts
-            if text not in before_set and not self._is_user_or_ui_text(text, prompt_clean)
+            self._current_reply_from_text(text, before_blocks, prompt_clean)
+            for text in after_texts
+            if text not in before_set
         ]
+        new_texts = [text for text in new_texts if text]
         if new_texts:
-            return new_texts[-1]
+            return self._best_reply_candidate(new_texts)
 
-        before_blocks = set(self._split_text_blocks("\n".join(before_texts) + "\n" + before_body))
         after_blocks = self._collect_visible_text_blocks(page)
         new_blocks = [
             text for text in after_blocks
             if text not in before_blocks and not self._is_user_or_ui_text(text, prompt_clean)
         ]
         if new_blocks:
-            return _clean_text("\n".join(new_blocks[-20:]))
+            return _clean_text("\n".join(new_blocks))
 
         after_body = self._body_text(page)
         suffix = self._body_text_delta(before_body, after_body)
@@ -786,9 +1113,37 @@ class DoubaoPlaywrightSession:
                 if not self._is_user_or_ui_text(text, prompt_clean)
             ]
             if suffix_blocks:
-                return _clean_text("\n".join(suffix_blocks[-20:]))
-        if after_texts:
-            return after_texts[-1]
+                return _clean_text("\n".join(suffix_blocks))
+        return ""
+
+    @staticmethod
+    def _best_reply_candidate(texts: list[str]) -> str:
+        unique_texts = list(dict.fromkeys(_clean_text(text) for text in texts if _clean_text(text)))
+        if not unique_texts:
+            return ""
+        return max(
+            unique_texts,
+            key=lambda text: (
+                len(DoubaoPlaywrightSession._split_text_blocks(text)),
+                len(text),
+            ),
+        )
+
+    @staticmethod
+    def _current_reply_from_text(text: str, before_blocks: set[str], prompt_text: str) -> str:
+        cleaned = _clean_text(text)
+        if not cleaned or DoubaoPlaywrightSession._is_user_or_ui_text(cleaned, prompt_text):
+            return ""
+
+        blocks = DoubaoPlaywrightSession._split_text_blocks(cleaned)
+        fresh_blocks = [
+            block for block in blocks
+            if block not in before_blocks and not DoubaoPlaywrightSession._is_user_or_ui_text(block, prompt_text)
+        ]
+        if fresh_blocks and len(fresh_blocks) < len(blocks):
+            return _clean_text("\n".join(fresh_blocks))
+        if fresh_blocks:
+            return cleaned
         return ""
 
     def _collect_visible_text_blocks(self, page: Any) -> list[str]:
@@ -1650,7 +2005,7 @@ class DoubaoPlaywrightWorker:
 SESSION = DoubaoPlaywrightWorker()
 
 
-ASPECT_RATIO_OPTIONS = {
+RATIO_SUFFIXES = {
     "auto": "",
     "1:1": "，比例 「1:1」",
     "2:3": "，比例 「2:3」",
@@ -1661,213 +2016,310 @@ ASPECT_RATIO_OPTIONS = {
 }
 
 
-class DoubaoChatNode:
-    """纯文本对话节点：输入文本发送给豆包AI，返回回复文本"""
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
-    FUNCTION = "run"
+class DoubaoBasePlaywrightNode:
     CATEGORY = "Doubao/Playwright"
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+
+    NEW_CONVERSATION = False
+    TRY_HD_DOWNLOAD = True
+    BROWSER_EXECUTABLE_PATH = ""
+    USER_DATA_DIR = ""
+    INPUT_SELECTOR = ""
+    UPLOAD_SELECTOR = ""
+    SEND_BUTTON_SELECTOR = ""
+    NEW_CHAT_SELECTOR = ""
+    ASSISTANT_MESSAGE_SELECTOR = ""
 
     @classmethod
-    def INPUT_TYPES(cls) -> dict[str, Any]:
+    def _common_inputs(cls) -> dict[str, Any]:
         return {
-            "required": {
-                "text": ("STRING", {"multiline": True, "default": ""}),
-                "website_url": ("STRING", {"default": "https://www.doubao.com/chat/"}),
-                "new_conversation": ("BOOLEAN", {"default": False, "label_on": "开启新对话", "label_off": "继续当前对话"}),
-                "browser_channel": ("STRING", {"default": "chrome"}),
-                "browser_executable_path": ("STRING", {"default": ""}),
-                "user_data_dir": ("STRING", {"default": ""}),
-                "wait_timeout": ("INT", {"default": 240, "min": 30, "max": 1800, "step": 10}),
-                "stable_seconds": ("INT", {"default": 5, "min": 2, "max": 60, "step": 1}),
-                "input_selector": ("STRING", {"default": ""}),
-                "send_button_selector": ("STRING", {"default": ""}),
-                "new_chat_selector": ("STRING", {"default": ""}),
-                "assistant_message_selector": ("STRING", {"default": ""}),
-            },
+            "website_url": (
+                "STRING",
+                {
+                    "default": "https://www.doubao.com/chat/",
+                },
+            ),
+            "image_save_path": (
+                "STRING",
+                {
+                    "default": "output/doubao_playwright",
+                },
+            ),
+            "browser_channel": (
+                ["chromium", "chrome", "msedge"],
+                {
+                    "default": "chromium",
+                },
+            ),
+            "wait_timeout": (
+                "INT",
+                {
+                    "default": 240,
+                    "min": 30,
+                    "max": 1800,
+                    "step": 10,
+                },
+            ),
+            "stable_seconds": (
+                "INT",
+                {
+                    "default": 4,
+                    "min": 2,
+                    "max": 60,
+                    "step": 1,
+                },
+            ),
         }
-
-    def run(self, text, website_url, new_conversation, browser_channel, browser_executable_path, user_data_dir, wait_timeout, stable_seconds, input_selector, send_button_selector, new_chat_selector, assistant_message_selector):
-        save_dir = _resolve_path("output/doubao_playwright", "output/doubao_playwright")
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        _, generated_text = SESSION.send_and_collect(
-            website_url=website_url,
-            image_paths=[],
-            prompt_text=text or "",
-            save_dir=save_dir,
-            new_conversation=bool(new_conversation),
-            browser_channel=browser_channel,
-            browser_executable_path=browser_executable_path,
-            user_data_dir=user_data_dir,
-            input_selector=input_selector,
-            upload_selector="",
-            send_button_selector=send_button_selector,
-            new_chat_selector=new_chat_selector,
-            assistant_message_selector=assistant_message_selector,
-            wait_timeout=int(wait_timeout),
-            stable_seconds=int(stable_seconds),
-            min_output_images=0,
-            try_hd_download=False,
-        )
-
-        return {"ui": {"text": [generated_text]}, "result": (generated_text,)}
-
-
-class DoubaoTextToImageNode:
-    """文生图节点：输入文本，拼接前缀和比例后发送给豆包AI，返回生成的图片和回复文本"""
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("images", "text")
-    FUNCTION = "run"
-    CATEGORY = "Doubao/Playwright"
 
     @classmethod
-    def INPUT_TYPES(cls) -> dict[str, Any]:
-        return {
-            "required": {
-                "text": ("STRING", {"multiline": True, "default": ""}),
-                "aspect_ratio": (list(ASPECT_RATIO_OPTIONS.keys()), {"default": "auto"}),
-                "website_url": ("STRING", {"default": "https://www.doubao.com/chat/"}),
-                "image_save_path": ("STRING", {"default": "output/doubao_playwright"}),
-                "new_conversation": ("BOOLEAN", {"default": False, "label_on": "开启新对话", "label_off": "继续当前对话"}),
-                "try_hd_download": ("BOOLEAN", {"default": True, "label_on": "尝试高清下载", "label_off": "直接抓取网页图片"}),
-                "browser_channel": ("STRING", {"default": "chrome"}),
-                "browser_executable_path": ("STRING", {"default": ""}),
-                "user_data_dir": ("STRING", {"default": ""}),
-                "wait_timeout": ("INT", {"default": 240, "min": 30, "max": 1800, "step": 10}),
-                "stable_seconds": ("INT", {"default": 5, "min": 2, "max": 60, "step": 1}),
-                "input_selector": ("STRING", {"default": ""}),
-                "send_button_selector": ("STRING", {"default": ""}),
-                "new_chat_selector": ("STRING", {"default": ""}),
-                "assistant_message_selector": ("STRING", {"default": ""}),
-            },
-        }
+    def IS_CHANGED(cls, **kwargs: Any) -> float:
+        return time.time()
 
-    def run(self, text, aspect_ratio, website_url, image_save_path, new_conversation, try_hd_download, browser_channel, browser_executable_path, user_data_dir, wait_timeout, stable_seconds, input_selector, send_button_selector, new_chat_selector, assistant_message_selector):
+    def _send_to_doubao(
+        self,
+        *,
+        prompt_text: str,
+        image_tensors: list[torch.Tensor | None] | None = None,
+        collect_images: bool,
+        min_output_images: int,
+        website_url: str,
+        image_save_path: str,
+        browser_channel: str,
+        wait_timeout: int,
+        stable_seconds: int,
+    ) -> tuple[list[Path], str]:
         save_dir = _resolve_path(image_save_path, "output/doubao_playwright")
         save_dir.mkdir(parents=True, exist_ok=True)
+        input_paths = self._save_input_images(save_dir, image_tensors or [])
 
-        ratio_suffix = ASPECT_RATIO_OPTIONS.get(aspect_ratio, "")
-        full_prompt = f"帮我生成图片：{text}{ratio_suffix}"
-
-        downloaded, generated_text = SESSION.send_and_collect(
+        return SESSION.send_and_collect(
             website_url=website_url,
-            image_paths=[],
-            prompt_text=full_prompt,
+            image_paths=input_paths,
+            prompt_text=prompt_text or "",
             save_dir=save_dir,
-            new_conversation=bool(new_conversation),
+            new_conversation=self.NEW_CONVERSATION,
             browser_channel=browser_channel,
-            browser_executable_path=browser_executable_path,
-            user_data_dir=user_data_dir,
-            input_selector=input_selector,
-            upload_selector="",
-            send_button_selector=send_button_selector,
-            new_chat_selector=new_chat_selector,
-            assistant_message_selector=assistant_message_selector,
-            wait_timeout=int(wait_timeout),
-            stable_seconds=int(stable_seconds),
-            min_output_images=1,
-            try_hd_download=bool(try_hd_download),
+            browser_executable_path=self.BROWSER_EXECUTABLE_PATH,
+            user_data_dir=self.USER_DATA_DIR,
+            input_selector=self.INPUT_SELECTOR,
+            upload_selector=self.UPLOAD_SELECTOR,
+            send_button_selector=self.SEND_BUTTON_SELECTOR,
+            new_chat_selector=self.NEW_CHAT_SELECTOR,
+            assistant_message_selector=self.ASSISTANT_MESSAGE_SELECTOR,
+            wait_timeout=wait_timeout,
+            stable_seconds=stable_seconds,
+            min_output_images=min_output_images,
+            try_hd_download=self.TRY_HD_DOWNLOAD,
+            collect_images=collect_images,
         )
 
+    @staticmethod
+    def _compose_image_prompt(prompt_prefix: str, text: str, image_size: str) -> str:
+        prefix = prompt_prefix if prompt_prefix is not None else "帮我生成图片："
+        suffix = RATIO_SUFFIXES.get(image_size or "auto", "")
+        return f"{prefix}{text or ''}{suffix}"
+
+    @staticmethod
+    def _image_output(downloaded: list[Path]) -> torch.Tensor:
         output_images = _paths_to_image_batch(downloaded[:4])
         if output_images is None:
-            output_images = _blank_image()
+            return _blank_image()
         _log(f"图片输出 batch 数量：{output_images.shape[0]}")
+        return output_images
 
+    def _save_input_images(self, save_dir: Path, images: list[torch.Tensor | None]) -> list[Path]:
+        upload_dir = save_dir / "_uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        run_id = time.strftime("%Y%m%d_%H%M%S")
+        paths: list[Path] = []
+        for port_index, image in enumerate(images, start=1):
+            if image is None:
+                continue
+            frames = image if image.ndim == 4 else image[None, ...]
+            for batch_index, frame in enumerate(frames):
+                if len(paths) >= 5:
+                    return paths
+                pil_image = _tensor_frame_to_pil(frame)
+                path = upload_dir / f"input_{run_id}_{port_index}_{batch_index}.png"
+                pil_image.save(path)
+                paths.append(path)
+        return paths
+
+
+class DoubaoTextToTextNode(DoubaoBasePlaywrightNode):
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
-            "ui": {"text": [generated_text], "saved_images": [str(p) for p in downloaded]},
-            "result": (output_images, generated_text),
+            "required": {
+                "text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                    },
+                ),
+                **cls._common_inputs(),
+            },
+        }
+
+    def run(
+        self,
+        text: str,
+        website_url: str,
+        image_save_path: str,
+        browser_channel: str,
+        wait_timeout: int,
+        stable_seconds: int,
+    ) -> dict[str, Any]:
+        _, generated_text = self._send_to_doubao(
+            prompt_text=text or "",
+            collect_images=False,
+            min_output_images=0,
+            website_url=website_url,
+            image_save_path=image_save_path,
+            browser_channel=browser_channel,
+            wait_timeout=int(wait_timeout),
+            stable_seconds=int(stable_seconds),
+        )
+        return {
+            "ui": {"text": [generated_text]},
+            "result": (generated_text,),
         }
 
 
-class DoubaoImageToTextNode:
-    """图生文节点：上传图片发送给豆包AI并附加描述提示，返回回复文本"""
+class DoubaoTextToImageNode(DoubaoBasePlaywrightNode):
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "text")
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                    },
+                ),
+                "prompt_prefix": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "帮我生成图片：",
+                    },
+                ),
+                "image_size": (list(RATIO_SUFFIXES.keys()), {"default": "auto"}),
+                **cls._common_inputs(),
+            },
+        }
+
+    def run(
+        self,
+        text: str,
+        prompt_prefix: str,
+        image_size: str,
+        website_url: str,
+        image_save_path: str,
+        browser_channel: str,
+        wait_timeout: int,
+        stable_seconds: int,
+    ) -> dict[str, Any]:
+        prompt_text = self._compose_image_prompt(prompt_prefix, text, image_size)
+        downloaded, generated_text = self._send_to_doubao(
+            prompt_text=prompt_text,
+            collect_images=True,
+            min_output_images=1,
+            website_url=website_url,
+            image_save_path=image_save_path,
+            browser_channel=browser_channel,
+            wait_timeout=int(wait_timeout),
+            stable_seconds=int(stable_seconds),
+        )
+        return {
+            "ui": {
+                "text": [generated_text],
+                "saved_images": [str(path) for path in downloaded],
+            },
+            "result": (self._image_output(downloaded), generated_text),
+        }
+
+
+class DoubaoImageToTextNode(DoubaoBasePlaywrightNode):
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("text",)
-    FUNCTION = "run"
-    CATEGORY = "Doubao/Playwright"
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "website_url": ("STRING", {"default": "https://www.doubao.com/chat/"}),
-                "new_conversation": ("BOOLEAN", {"default": False, "label_on": "开启新对话", "label_off": "继续当前对话"}),
-                "browser_channel": ("STRING", {"default": "chrome"}),
-                "browser_executable_path": ("STRING", {"default": ""}),
-                "user_data_dir": ("STRING", {"default": ""}),
-                "wait_timeout": ("INT", {"default": 240, "min": 30, "max": 1800, "step": 10}),
-                "stable_seconds": ("INT", {"default": 5, "min": 2, "max": 60, "step": 1}),
-                "input_selector": ("STRING", {"default": ""}),
-                "upload_selector": ("STRING", {"default": ""}),
-                "send_button_selector": ("STRING", {"default": ""}),
-                "new_chat_selector": ("STRING", {"default": ""}),
-                "assistant_message_selector": ("STRING", {"default": ""}),
+                "prompt_prefix": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "详细描述图片，",
+                    },
+                ),
+                **cls._common_inputs(),
             },
         }
 
-    def run(self, image, website_url, new_conversation, browser_channel, browser_executable_path, user_data_dir, wait_timeout, stable_seconds, input_selector, upload_selector, send_button_selector, new_chat_selector, assistant_message_selector):
-        save_dir = _resolve_path("output/doubao_playwright", "output/doubao_playwright")
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        upload_dir = save_dir / "_uploads"
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        pil_image = _tensor_frame_to_pil(image)
-        input_path = upload_dir / f"input_{time.strftime('%Y%m%d_%H%M%S')}.png"
-        pil_image.save(input_path)
-
-        _, generated_text = SESSION.send_and_collect(
+    def run(
+        self,
+        image: torch.Tensor,
+        prompt_prefix: str,
+        website_url: str,
+        image_save_path: str,
+        browser_channel: str,
+        wait_timeout: int,
+        stable_seconds: int,
+    ) -> dict[str, Any]:
+        _, generated_text = self._send_to_doubao(
+            prompt_text=prompt_prefix or "",
+            image_tensors=[image],
+            collect_images=False,
+            min_output_images=0,
             website_url=website_url,
-            image_paths=[input_path],
-            prompt_text="详细描述图片：",
-            save_dir=save_dir,
-            new_conversation=bool(new_conversation),
+            image_save_path=image_save_path,
             browser_channel=browser_channel,
-            browser_executable_path=browser_executable_path,
-            user_data_dir=user_data_dir,
-            input_selector=input_selector,
-            upload_selector=upload_selector,
-            send_button_selector=send_button_selector,
-            new_chat_selector=new_chat_selector,
-            assistant_message_selector=assistant_message_selector,
             wait_timeout=int(wait_timeout),
             stable_seconds=int(stable_seconds),
-            min_output_images=0,
-            try_hd_download=False,
         )
+        return {
+            "ui": {"text": [generated_text]},
+            "result": (generated_text,),
+        }
 
-        return {"ui": {"text": [generated_text]}, "result": (generated_text,)}
 
-
-class DoubaoMultiImageNode:
-    """多图输入节点：最多5张参考图+文本发送给豆包AI，返回生成的图片和回复文本"""
+class DoubaoImagesTextToImageNode(DoubaoBasePlaywrightNode):
     RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("images", "text")
-    FUNCTION = "run"
-    CATEGORY = "Doubao/Playwright"
+    RETURN_NAMES = ("image", "text")
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "text": ("STRING", {"multiline": True, "default": ""}),
-                "aspect_ratio": (list(ASPECT_RATIO_OPTIONS.keys()), {"default": "auto"}),
-                "website_url": ("STRING", {"default": "https://www.doubao.com/chat/"}),
-                "image_save_path": ("STRING", {"default": "output/doubao_playwright"}),
-                "new_conversation": ("BOOLEAN", {"default": False, "label_on": "开启新对话", "label_off": "继续当前对话"}),
-                "try_hd_download": ("BOOLEAN", {"default": True, "label_on": "尝试高清下载", "label_off": "直接抓取网页图片"}),
-                "browser_channel": ("STRING", {"default": "chrome"}),
-                "browser_executable_path": ("STRING", {"default": ""}),
-                "user_data_dir": ("STRING", {"default": ""}),
-                "wait_timeout": ("INT", {"default": 240, "min": 30, "max": 1800, "step": 10}),
-                "stable_seconds": ("INT", {"default": 5, "min": 2, "max": 60, "step": 1}),
-                "input_selector": ("STRING", {"default": ""}),
-                "upload_selector": ("STRING", {"default": ""}),
-                "send_button_selector": ("STRING", {"default": ""}),
-                "new_chat_selector": ("STRING", {"default": ""}),
-                "assistant_message_selector": ("STRING", {"default": ""}),
+                "text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                    },
+                ),
+                "prompt_prefix": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "帮我生成图片：",
+                    },
+                ),
+                "image_size": (list(RATIO_SUFFIXES.keys()), {"default": "auto"}),
+                **cls._common_inputs(),
             },
             "optional": {
                 "image_1": ("IMAGE",),
@@ -1878,70 +2330,53 @@ class DoubaoMultiImageNode:
             },
         }
 
-    def run(self, text, aspect_ratio, website_url, image_save_path, new_conversation, try_hd_download, browser_channel, browser_executable_path, user_data_dir, wait_timeout, stable_seconds, input_selector, upload_selector, send_button_selector, new_chat_selector, assistant_message_selector, image_1=None, image_2=None, image_3=None, image_4=None, image_5=None):
-        save_dir = _resolve_path(image_save_path, "output/doubao_playwright")
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        upload_dir = save_dir / "_uploads"
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        run_id = time.strftime("%Y%m%d_%H%M%S")
-        input_paths: list[Path] = []
-        for port_index, img in enumerate([image_1, image_2, image_3, image_4, image_5], start=1):
-            if img is None:
-                continue
-            frames = img if img.ndim == 4 else img[None, ...]
-            for batch_index, frame in enumerate(frames):
-                if len(input_paths) >= 5:
-                    break
-                pil_img = _tensor_frame_to_pil(frame)
-                path = upload_dir / f"input_{run_id}_{port_index}_{batch_index}.png"
-                pil_img.save(path)
-                input_paths.append(path)
-
-        ratio_suffix = ASPECT_RATIO_OPTIONS.get(aspect_ratio, "")
-        full_prompt = f"帮我生成图片：{text}{ratio_suffix}"
-
-        downloaded, generated_text = SESSION.send_and_collect(
+    def run(
+        self,
+        text: str,
+        prompt_prefix: str,
+        image_size: str,
+        website_url: str,
+        image_save_path: str,
+        browser_channel: str,
+        wait_timeout: int,
+        stable_seconds: int,
+        image_1: torch.Tensor | None = None,
+        image_2: torch.Tensor | None = None,
+        image_3: torch.Tensor | None = None,
+        image_4: torch.Tensor | None = None,
+        image_5: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        prompt_text = self._compose_image_prompt(prompt_prefix, text, image_size)
+        downloaded, generated_text = self._send_to_doubao(
+            prompt_text=prompt_text,
+            image_tensors=[image_1, image_2, image_3, image_4, image_5],
+            collect_images=True,
+            min_output_images=1,
             website_url=website_url,
-            image_paths=input_paths,
-            prompt_text=full_prompt,
-            save_dir=save_dir,
-            new_conversation=bool(new_conversation),
+            image_save_path=image_save_path,
             browser_channel=browser_channel,
-            browser_executable_path=browser_executable_path,
-            user_data_dir=user_data_dir,
-            input_selector=input_selector,
-            upload_selector=upload_selector,
-            send_button_selector=send_button_selector,
-            new_chat_selector=new_chat_selector,
-            assistant_message_selector=assistant_message_selector,
             wait_timeout=int(wait_timeout),
             stable_seconds=int(stable_seconds),
-            min_output_images=1,
-            try_hd_download=bool(try_hd_download),
         )
-
-        output_images = _paths_to_image_batch(downloaded[:4])
-        if output_images is None:
-            output_images = _blank_image()
-        _log(f"图片输出 batch 数量：{output_images.shape[0]}")
-
         return {
-            "ui": {"text": [generated_text], "saved_images": [str(p) for p in downloaded]},
-            "result": (output_images, generated_text),
+            "ui": {
+                "text": [generated_text],
+                "saved_images": [str(path) for path in downloaded],
+            },
+            "result": (self._image_output(downloaded), generated_text),
         }
 
 
 NODE_CLASS_MAPPINGS = {
-    "DoubaoChatNode": DoubaoChatNode,
+    "DoubaoTextToTextNode": DoubaoTextToTextNode,
     "DoubaoTextToImageNode": DoubaoTextToImageNode,
     "DoubaoImageToTextNode": DoubaoImageToTextNode,
-    "DoubaoMultiImageNode": DoubaoMultiImageNode,
+    "DoubaoImagesTextToImageNode": DoubaoImagesTextToImageNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DoubaoChatNode": "Doubao Chat (Text-to-Text)",
-    "DoubaoTextToImageNode": "Doubao Text-to-Image",
-    "DoubaoImageToTextNode": "Doubao Image-to-Text",
-    "DoubaoMultiImageNode": "Doubao Multi-Image Input",
+    "DoubaoTextToTextNode": "Doubao 文生文",
+    "DoubaoTextToImageNode": "Doubao 文生图",
+    "DoubaoImageToTextNode": "Doubao 图生文",
+    "DoubaoImagesTextToImageNode": "Doubao 图文生图",
 }
