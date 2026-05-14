@@ -8,7 +8,7 @@
 
 - 支持文生文、文生图、图生文、图文生图 4 类节点。
 - 支持最多 5 张输入图片参与图文生图。
-- 文生图和图文生图会尝试下载本轮新增图片，最多返回 4 张图片组成的 batch。
+- 文生图和图文生图会尝试下载本轮新增图片，最多返回 4 张图片组成的 batch，并根据透明 PNG 的 alpha 额外输出 `mask`。
 - 自动复用浏览器登录状态，首次运行后可在打开的浏览器中手动登录豆包。
 - 自动加载 `browser_extension` 下的浏览器扩展，优先捕获豆包生成图的无水印图片链接。
 - Playwright 在独立线程中运行，避免阻塞 ComfyUI 的 asyncio 执行线程。
@@ -20,9 +20,9 @@
 | 节点名 | 输入 | 输出 | 用途 |
 | --- | --- | --- | --- |
 | `Doubao 文生文` | `text` | `text` | 把文本发送给豆包，返回文字回复 |
-| `Doubao 文生图` | `text`、`prompt_prefix`、`image_size` | `image`、`text` | 让豆包根据文本生成图片 |
+| `Doubao 文生图` | `text`、`prompt_prefix`、`image_size` | `image`、`mask`、`text` | 让豆包根据文本生成图片 |
 | `Doubao 图生文` | `image`、`prompt_prefix` | `text` | 上传图片，让豆包描述或分析图片 |
-| `Doubao 图文生图` | `text`、`prompt_prefix`、`image_size`，可选 `image_1` 到 `image_5` | `image`、`text` | 上传参考图并让豆包生成新图 |
+| `Doubao 图文生图` | `text`、`prompt_prefix`、`image_size`，可选 `image_1` 到 `image_5` | `image`、`mask`、`text` | 上传参考图并让豆包生成新图 |
 
 ## 安装
 
@@ -86,6 +86,7 @@ python_embeded/python.exe -m playwright install chromium
 
 - `text` 输出为豆包本轮回复中提取到的文本。
 - `image` 输出为本轮下载到的新图片 batch，最多 4 张。
+- `mask` 输出由下载图片的 alpha 通道生成；透明区域为 `1.0`，不透明区域为 `0.0`。
 - 如果多张输出图片尺寸不一致，节点会补边到同一尺寸后合并为 batch。
 - 如果图片节点没有成功下载到图片，会返回一张 `64x64` 黑图占位，同时仍返回文本输出。
 - 生成图片会保存到 `image_save_path`，上传用的临时图片会保存到 `image_save_path/_uploads`。

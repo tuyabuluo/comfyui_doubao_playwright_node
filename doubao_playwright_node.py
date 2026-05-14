@@ -93,6 +93,10 @@ def _blank_image() -> torch.Tensor:
     return torch.zeros((1, 64, 64, 3), dtype=torch.float32)
 
 
+def _blank_mask() -> torch.Tensor:
+    return torch.zeros((1, 64, 64), dtype=torch.float32)
+
+
 def _tensor_frame_to_pil(frame: torch.Tensor) -> Image.Image:
     frame = frame.detach().cpu()
     if frame.ndim == 4:
@@ -112,17 +116,27 @@ def _pil_to_tensor(path: Path) -> torch.Tensor:
     return torch.from_numpy(arr)[None, ...]
 
 
-def _paths_to_image_batch(paths: list[Path]) -> torch.Tensor | None:
+def _pil_to_rgb_and_mask(image: Image.Image) -> tuple[Image.Image, Image.Image]:
+    rgba = image.convert("RGBA")
+    alpha = np.asarray(rgba.getchannel("A")).astype(np.float32) / 255.0
+    mask = np.clip((1.0 - alpha) * 255.0, 0, 255).astype(np.uint8)
+    return rgba.convert("RGB"), Image.fromarray(mask, mode="L")
+
+
+def _paths_to_image_batch_and_mask(paths: list[Path]) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     images: list[Image.Image] = []
+    masks: list[Image.Image] = []
     for path in paths:
         try:
             with Image.open(path) as image:
-                images.append(image.convert("RGB"))
+                rgb, mask = _pil_to_rgb_and_mask(image)
+                images.append(rgb)
+                masks.append(mask)
         except Exception:
             continue
 
     if not images:
-        return None
+        return None, None
 
     widths = [image.width for image in images]
     heights = [image.height for image in images]
@@ -131,17 +145,23 @@ def _paths_to_image_batch(paths: list[Path]) -> torch.Tensor | None:
         _log(f"输出图片尺寸不一致，已补边合并为 batch：{target_size[0]}x{target_size[1]}")
 
     tensors: list[torch.Tensor] = []
-    for image in images:
+    mask_tensors: list[torch.Tensor] = []
+    for image, mask in zip(images, masks):
         if image.size != target_size:
             canvas = Image.new("RGB", target_size)
+            mask_canvas = Image.new("L", target_size, 255)
             x = (target_size[0] - image.width) // 2
             y = (target_size[1] - image.height) // 2
             canvas.paste(image, (x, y))
+            mask_canvas.paste(mask, (x, y))
             image = canvas
+            mask = mask_canvas
         arr = np.asarray(image).astype(np.float32) / 255.0
+        mask_arr = np.asarray(mask).astype(np.float32) / 255.0
         tensors.append(torch.from_numpy(arr)[None, ...])
+        mask_tensors.append(torch.from_numpy(mask_arr)[None, ...])
 
-    return torch.cat(tensors, dim=0)
+    return torch.cat(tensors, dim=0), torch.cat(mask_tensors, dim=0)
 
 
 def _extension_from_content_type(content_type: str, fallback: str = ".png") -> str:
@@ -2121,12 +2141,12 @@ class DoubaoBasePlaywrightNode:
         return f"{prefix}{text or ''}{suffix}"
 
     @staticmethod
-    def _image_output(downloaded: list[Path]) -> torch.Tensor:
-        output_images = _paths_to_image_batch(downloaded[:4])
-        if output_images is None:
-            return _blank_image()
+    def _image_and_mask_output(downloaded: list[Path]) -> tuple[torch.Tensor, torch.Tensor]:
+        output_images, output_masks = _paths_to_image_batch_and_mask(downloaded[:4])
+        if output_images is None or output_masks is None:
+            return _blank_image(), _blank_mask()
         _log(f"图片输出 batch 数量：{output_images.shape[0]}")
-        return output_images
+        return output_images, output_masks
 
     def _save_input_images(self, save_dir: Path, images: list[torch.Tensor | None]) -> list[Path]:
         upload_dir = save_dir / "_uploads"
@@ -2192,8 +2212,8 @@ class DoubaoTextToTextNode(DoubaoBasePlaywrightNode):
 
 
 class DoubaoTextToImageNode(DoubaoBasePlaywrightNode):
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "text")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "mask", "text")
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -2240,12 +2260,13 @@ class DoubaoTextToImageNode(DoubaoBasePlaywrightNode):
             wait_timeout=int(wait_timeout),
             stable_seconds=int(stable_seconds),
         )
+        output_images, output_masks = self._image_and_mask_output(downloaded)
         return {
             "ui": {
                 "text": [generated_text],
                 "saved_images": [str(path) for path in downloaded],
             },
-            "result": (self._image_output(downloaded), generated_text),
+            "result": (output_images, output_masks, generated_text),
         }
 
 
@@ -2297,8 +2318,8 @@ class DoubaoImageToTextNode(DoubaoBasePlaywrightNode):
 
 
 class DoubaoImagesTextToImageNode(DoubaoBasePlaywrightNode):
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "text")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "mask", "text")
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -2358,12 +2379,13 @@ class DoubaoImagesTextToImageNode(DoubaoBasePlaywrightNode):
             wait_timeout=int(wait_timeout),
             stable_seconds=int(stable_seconds),
         )
+        output_images, output_masks = self._image_and_mask_output(downloaded)
         return {
             "ui": {
                 "text": [generated_text],
                 "saved_images": [str(path) for path in downloaded],
             },
-            "result": (self._image_output(downloaded), generated_text),
+            "result": (output_images, output_masks, generated_text),
         }
 
 
